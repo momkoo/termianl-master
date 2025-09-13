@@ -74,6 +74,9 @@ struct App {
     shutdown_signal: Arc<AtomicBool>,
     cursor_state: CursorState,
     terminal_area: Rect, // 실제 터미널 컨텐츠 영역
+    scroll_offset: u16,  // 스크롤 오프셋 (위로 스크롤된 줄 수)
+    total_lines: usize,  // 전체 터미널 출력 라인 수
+    quit_confirm_count: u8, // Ctrl+Z 종료 확인 카운터
 }
 
 impl App {
@@ -102,6 +105,9 @@ impl App {
             shutdown_signal,
             cursor_state: CursorState::default(),
             terminal_area: Rect::default(),
+            scroll_offset: 0,
+            total_lines: 0,
+            quit_confirm_count: 0,
         })
     }
 
@@ -111,30 +117,48 @@ impl App {
         loop {
             // 화면 그리기
             ratatui_terminal.draw(|f| {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
+                // 전체 영역을 터미널과 스크롤바로 분할
+                let main_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
                     .margin(1)
-                    .constraints([Constraint::Percentage(100)].as_ref())
+                    .constraints([Constraint::Min(10), Constraint::Length(1)].as_ref()) // 터미널 영역 + 스크롤바 1칸
                     .split(f.area());
 
-                // 실제 터미널 컨텐츠 영역 저장 (테두리 제외)
-                self.terminal_area = chunks[0];
-
-                // 터미널 내용을 줄별로 가져오기 (선택 영역 하이라이트 포함)
-                let lines = match self.terminal.get_renderable_content() {
-                    Ok(content_lines) => {
-                        content_lines.into_iter()
-                            .enumerate()
-                            .map(|(row_idx, line)| self.render_line_with_selection(line, row_idx as u16))
-                            .collect::<Vec<_>>()
-                    },
-                    Err(_) => vec![Line::from(Span::raw("터미널 내용 로딩 중..."))]
-                };
+                // 실제 터미널 컨텐츠 영역 저장 (스크롤바 제외)
+                self.terminal_area = main_chunks[0];
+                let scrollbar_area = main_chunks[1];
 
                 // 터미널 커서 위치 가져오기 및 상태 업데이트
                 let (cursor_col, cursor_row, cursor_char) = self.terminal.get_renderable_cursor();
                 self.cursor_state.position = (cursor_col, cursor_row);
                 self.cursor_state.character = cursor_char;
+
+                // 터미널 내용을 줄별로 가져오기 (선택 영역 하이라이트 포함)
+                let all_lines = match self.terminal.get_renderable_content() {
+                    Ok(content_lines) => {
+                        // 전체 라인 수 업데이트
+                        self.total_lines = content_lines.len();
+
+                        // 전체 라인들을 스크롤 오프셋과 함께 렌더링
+                        let all_lines_with_selection = content_lines.into_iter()
+                            .enumerate()
+                            .map(|(row_idx, line)| self.render_line_with_selection(line, row_idx as u16))
+                            .collect::<Vec<_>>();
+                        all_lines_with_selection
+                    },
+                    Err(_) => vec![Line::from(Span::raw("터미널 내용 로딩 중..."))]
+                };
+
+                // 스크롤 오프셋을 적용하여 보여줄 라인들만 선택
+                let visible_height = self.terminal_area.height.saturating_sub(2) as usize;
+                let start_idx = self.scroll_offset as usize;
+                let end_idx = (start_idx + visible_height).min(all_lines.len());
+
+                let lines = if start_idx < all_lines.len() {
+                    all_lines[start_idx..end_idx].to_vec()
+                } else {
+                    vec![]
+                };
 
                 // 선택 영역 상태 표시 추가
                 let selection_info = if self.text_selection.is_active {
@@ -143,13 +167,45 @@ impl App {
                     String::new()
                 };
 
+                // 스크롤 위치 정보 (항상 표시)
+                let scroll_info = {
+                    let scroll_percentage = if self.total_lines > visible_height && self.total_lines > 0 {
+                        (self.scroll_offset as f32 / (self.total_lines.saturating_sub(visible_height)) as f32 * 100.0) as u16
+                    } else {
+                        0
+                    };
+                    format!(" [라인:{} 표시:{} 오프셋:{} ({}%)]",
+                        self.total_lines, visible_height, self.scroll_offset, scroll_percentage)
+                };
+
+                // 커서 디버그 정보
+                let cursor_debug = format!(" [커서:{}x{} 절대:{} 상대:{}]",
+                    cursor_col, cursor_row,
+                    if self.total_lines > visible_height { (self.total_lines - visible_height) as u16 + cursor_row } else { cursor_row },
+                    if self.total_lines > visible_height {
+                        let abs_row = (self.total_lines - visible_height) as u16 + cursor_row;
+                        if abs_row >= self.scroll_offset { abs_row - self.scroll_offset } else { 0 }
+                    } else { cursor_row }
+                );
+
+                // 종료 상태 메시지
+                let quit_status = if self.quit_confirm_count > 0 {
+                    " [Ctrl+Z로 다시 누르면 종료됩니다]"
+                } else {
+                    ""
+                };
+
                 let paragraph = Paragraph::new(lines)
                     .block(Block::default()
-                        .title(format!("Rust Terminal App (커서: {},{} '{}'){} - Left click/drag: select text, Ctrl+X: quit", cursor_col, cursor_row, cursor_char, selection_info))
+                        .title(format!("Rust Terminal{}{}{}{} - 마우스휠/PageUp/Down: 스크롤, Ctrl+Z: 종료",
+                            selection_info, scroll_info, cursor_debug, quit_status))
                         .borders(Borders::ALL))
                         .style(Style::default().bg(Color::Black));
 
-                f.render_widget(paragraph, chunks[0]);
+                f.render_widget(paragraph, main_chunks[0]);
+
+                // 스크롤바 렌더링
+                self.render_scrollbar(f, scrollbar_area);
 
                 // 실제 터미널 커서 위치로 이동
                 self.set_terminal_cursor_position(f);
@@ -183,11 +239,15 @@ impl App {
     /// 키 이벤트 처리
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+Z 안전 종료 - 첫 번째 누름 시 경고, 두 번째 누름 시 종료
+                if self.quit_confirm_count == 0 {
+                    self.quit_confirm_count = 1;
+                    debug!("First Ctrl+Z pressed - showing quit confirmation");
+                } else {
+                    self.should_quit = true;
+                    debug!("Second Ctrl+Z pressed - exiting application");
+                }
             }
             KeyCode::Char(c) => {
                 self.handle_char_input(c)?;
@@ -216,6 +276,36 @@ impl App {
             KeyCode::Left => {
                 let _ = self.terminal.input(b"\x1b[D");
             }
+            KeyCode::PageUp => {
+                // Page Up - 한 페이지 위로 스크롤
+                let page_size = self.terminal_area.height.saturating_sub(2) as u16;
+                self.scroll_offset = self.scroll_offset.saturating_sub(page_size);
+                debug!("Page up to offset: {}", self.scroll_offset);
+            }
+            KeyCode::PageDown => {
+                // Page Down - 한 페이지 아래로 스크롤
+                let page_size = self.terminal_area.height.saturating_sub(2) as u16;
+                let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
+                if self.total_lines > visible_lines {
+                    let max_scroll = self.total_lines.saturating_sub(visible_lines) as u16;
+                    self.scroll_offset = (self.scroll_offset + page_size).min(max_scroll);
+                    debug!("Page down to offset: {} / max: {}", self.scroll_offset, max_scroll);
+                }
+            }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+Home - 맨 위로
+                self.scroll_offset = 0;
+                debug!("Scrolled to top");
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+End - 맨 아래로
+                let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
+                if self.total_lines > visible_lines {
+                    let max_scroll = self.total_lines.saturating_sub(visible_lines) as u16;
+                    self.scroll_offset = max_scroll;
+                    debug!("Scrolled to bottom: offset={}", self.scroll_offset);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -236,7 +326,9 @@ impl App {
 
     /// 마우스 이벤트 처리
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
-        debug!("Mouse event: {:?}", mouse);
+        debug!("Mouse event: {:?} [Terminal Area: {}x{} at ({},{})]",
+            mouse, self.terminal_area.width, self.terminal_area.height,
+            self.terminal_area.x, self.terminal_area.y);
 
         // 마우스 이벤트를 터미널로 전달 (xterm mouse protocol)
         match mouse.kind {
@@ -247,18 +339,28 @@ impl App {
                 self.start_text_selection(mouse.column, mouse.row)?;
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                debug!("Mouse left release at ({}, {})", mouse.column, mouse.row);
+                debug!("Mouse left release at ({}, {}), is_dragging: {}, selection_active: {}",
+                    mouse.column, mouse.row, self.is_dragging, self.text_selection.is_active);
 
                 if self.is_dragging {
                     // 드래그 종료 - 텍스트 복사
                     self.finish_text_selection(mouse.column, mouse.row)?;
+                    debug!("Final selection state: {:?}", self.text_selection);
                     self.copy_selected_text()?;
+                    debug!("Text selection copied to clipboard");
+                } else if self.text_selection.is_active {
+                    // 단순 클릭으로 선택 완료 - 텍스트 복사
+                    self.finish_text_selection(mouse.column, mouse.row)?;
+                    debug!("Single click final selection: {:?}", self.text_selection);
+                    self.copy_selected_text()?;
+                    debug!("Single click selection copied to clipboard");
                 } else {
                     // 단순 클릭 - 커서 이동
                     if let Some((terminal_col, terminal_row)) = self.mouse_to_terminal_coords(mouse.column, mouse.row) {
                         // 커서 이동 escape sequence 전송
                         let escape_seq = format!("\x1b[{};{}H", terminal_row + 1, terminal_col + 1);
                         let _ = self.terminal.input(escape_seq.as_bytes());
+                        debug!("Cursor moved to ({}, {})", terminal_col, terminal_row);
                     }
                 }
             }
@@ -290,18 +392,35 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 debug!("Mouse scroll down at ({}, {})", mouse.column, mouse.row);
-                if self.terminal.is_mouse_mode_enabled() {
-                    if let Some((terminal_col, terminal_row)) = self.mouse_to_terminal_coords(mouse.column, mouse.row) {
-                        self.send_mouse_event(65, terminal_col, terminal_row)?; // 65 = scroll down
+                let visible_lines = self.terminal_area.height.saturating_sub(2) as usize; // 테두리 제외
+                debug!("Scroll check: total_lines={}, visible_lines={}, current_offset={}",
+                    self.total_lines, visible_lines, self.scroll_offset);
+
+                if self.total_lines > visible_lines {
+                    let max_scroll = self.total_lines.saturating_sub(visible_lines) as u16;
+                    if self.scroll_offset < max_scroll {
+                        let old_offset = self.scroll_offset;
+                        self.scroll_offset = (self.scroll_offset + 3).min(max_scroll); // 3줄씩 스크롤
+                        debug!("Scrolled down: {} -> {} (max: {})", old_offset, self.scroll_offset, max_scroll);
+                    } else {
+                        debug!("Already at max scroll: offset={}, max={}", self.scroll_offset, max_scroll);
                     }
+                } else {
+                    debug!("No scrolling possible: total_lines={} <= visible_lines={}", self.total_lines, visible_lines);
                 }
             }
             MouseEventKind::ScrollUp => {
                 debug!("Mouse scroll up at ({}, {})", mouse.column, mouse.row);
-                if self.terminal.is_mouse_mode_enabled() {
-                    if let Some((terminal_col, terminal_row)) = self.mouse_to_terminal_coords(mouse.column, mouse.row) {
-                        self.send_mouse_event(64, terminal_col, terminal_row)?; // 64 = scroll up
-                    }
+                let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
+                debug!("Scroll up check: total_lines={}, visible_lines={}, current_offset={}",
+                    self.total_lines, visible_lines, self.scroll_offset);
+
+                if self.scroll_offset > 0 {
+                    let old_offset = self.scroll_offset;
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3); // 3줄씩 스크롤
+                    debug!("Scrolled up: {} -> {}", old_offset, self.scroll_offset);
+                } else {
+                    debug!("Already at top: offset=0");
                 }
             }
             _ => {
@@ -328,6 +447,7 @@ impl App {
     /// 텍스트 선택 시작 (Zed 방식 좌표 변환 사용)
     fn start_text_selection(&mut self, col: u16, row: u16) -> Result<()> {
         if let Some((terminal_col, terminal_row)) = self.mouse_to_terminal_coords(col, row) {
+            debug!("Starting text selection at terminal coords: ({}, {})", terminal_col, terminal_row);
             self.text_selection = TextSelection {
                 start_row: terminal_row,
                 start_col: terminal_col,
@@ -335,18 +455,27 @@ impl App {
                 end_col: terminal_col,
                 is_active: true,
             };
-            self.is_dragging = true;
+            self.is_dragging = false; // 드래그는 실제 드래그 이벤트에서 시작
+            debug!("Text selection state: {:?}", self.text_selection);
+        } else {
+            debug!("Failed to convert mouse coords ({}, {}) to terminal coords", col, row);
         }
         Ok(())
     }
 
     /// 텍스트 선택 영역 업데이트 (Zed 방식 좌표 변환 사용)
     fn update_text_selection(&mut self, col: u16, row: u16) -> Result<()> {
-        if self.is_dragging && self.text_selection.is_active {
+        if self.text_selection.is_active {
             if let Some((terminal_col, terminal_row)) = self.mouse_to_terminal_coords(col, row) {
+                debug!("Updating selection to: ({}, {})", terminal_col, terminal_row);
                 self.text_selection.end_row = terminal_row;
                 self.text_selection.end_col = terminal_col;
+                debug!("Updated text selection state: {:?}", self.text_selection);
+            } else {
+                debug!("Failed to convert mouse coords ({}, {}) during update", col, row);
             }
+        } else {
+            debug!("Ignoring selection update - no active selection");
         }
         Ok(())
     }
@@ -440,16 +569,77 @@ impl App {
         }
     }
 
-    /// 실제 터미널 커서 위치 설정 (Zed 방식)
+    /// 스크롤바 렌더링
+    fn render_scrollbar(&self, f: &mut ratatui::Frame, scrollbar_area: Rect) {
+        if scrollbar_area.height < 3 {
+            return; // 너무 작으면 스크롤바를 그리지 않음
+        }
+
+        let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
+
+        // 스크롤 가능한 경우에만 스크롤바 표시
+        if self.total_lines > visible_lines {
+            let scrollbar_height = scrollbar_area.height as usize;
+            let max_scroll = self.total_lines.saturating_sub(visible_lines) as f32;
+
+            // 스크롤바 썸(thumb) 크기 계산 - 보이는 영역 비율에 따라
+            let thumb_size = ((visible_lines as f32 / self.total_lines as f32) * scrollbar_height as f32).max(1.0) as usize;
+
+            // 스크롤바 썸 위치 계산
+            let scroll_ratio = if max_scroll > 0.0 {
+                self.scroll_offset as f32 / max_scroll
+            } else {
+                0.0
+            };
+            let thumb_position = (scroll_ratio * (scrollbar_height - thumb_size) as f32) as usize;
+
+            // 스크롤바 그리기
+            for y in 0..scrollbar_height {
+                let is_thumb = y >= thumb_position && y < thumb_position + thumb_size;
+                let char = if is_thumb { '█' } else { '│' };
+                let style = if is_thumb {
+                    Style::default().fg(Color::White).bg(Color::Blue)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+                if scrollbar_area.y + (y as u16) < scrollbar_area.y + scrollbar_area.height {
+                    let span = Span::styled(char.to_string(), style);
+                    let line = Line::from(span);
+                    let para = Paragraph::new(line);
+
+                    let cell_area = Rect {
+                        x: scrollbar_area.x,
+                        y: scrollbar_area.y + y as u16,
+                        width: 1,
+                        height: 1,
+                    };
+                    f.render_widget(para, cell_area);
+                }
+            }
+        }
+    }
+
+    /// 실제 터미널 커서 위치 설정 (스크롤 오프셋 고려)
     fn set_terminal_cursor_position(&self, f: &mut ratatui::Frame) {
         let (cursor_col, cursor_row) = self.cursor_state.position;
 
-        // 터미널 영역 내부 좌표 계산 (테두리 제외)
-        let cursor_x = self.terminal_area.x + 1 + cursor_col;
-        let cursor_y = self.terminal_area.y + 1 + cursor_row;
+        // 커서가 현재 보이는 영역에 있는지 확인
+        if cursor_row >= self.scroll_offset {
+            let relative_cursor_row = cursor_row - self.scroll_offset;
+            let visible_height = self.terminal_area.height.saturating_sub(2);
 
-        // 실제 터미널 커서 위치 설정
-        f.set_cursor_position((cursor_x, cursor_y));
+            // 커서가 보이는 영역 내에 있으면 표시
+            if relative_cursor_row < visible_height {
+                let cursor_x = self.terminal_area.x + 1 + cursor_col;
+                let cursor_y = self.terminal_area.y + 1 + relative_cursor_row;
+                f.set_cursor_position((cursor_x, cursor_y));
+                return;
+            }
+        }
+
+        // 커서가 보이지 않는 영역에 있으면 숨김
+        f.set_cursor_position((0, 0));
     }
 
     /// Zed 방식 커서 렌더링 (사용하지 않음)
@@ -544,23 +734,89 @@ impl App {
         }
     }
 
+    /// 선택 영역이 있는 줄을 하이라이트하여 렌더링
+    fn render_line_with_selection(&self, line: String, row_idx: u16) -> Line<'_> {
+        if !self.text_selection.is_active {
+            return Line::from(Span::styled(line, Style::default().fg(Color::White)));
+        }
+
+        let (start_row, start_col, end_row, end_col) = self.normalize_selection();
+
+        // 디버그용 로깅 (첫 번째와 마지막 줄만 로그)
+        if row_idx == 0 || (row_idx < 5 && self.text_selection.is_active) {
+            debug!("Rendering line {} with selection: start=({},{}), end=({},{}), active={}",
+                row_idx, start_row, start_col, end_row, end_col, self.text_selection.is_active);
+        }
+
+        // 현재 줄이 선택 영역에 포함되는지 확인
+        if row_idx < start_row || row_idx > end_row {
+            return Line::from(Span::styled(line, Style::default().fg(Color::White)));
+        }
+
+        let line_chars: Vec<char> = line.chars().collect();
+        let mut spans = Vec::new();
+
+        for (col_idx, &ch) in line_chars.iter().enumerate() {
+            let is_selected = if row_idx == start_row && row_idx == end_row {
+                // 단일 줄 선택
+                col_idx >= start_col as usize && col_idx <= end_col as usize
+            } else if row_idx == start_row {
+                // 시작 줄
+                col_idx >= start_col as usize
+            } else if row_idx == end_row {
+                // 끝 줄
+                col_idx <= end_col as usize
+            } else {
+                // 중간 줄 (전체 선택)
+                true
+            };
+
+            let style = if is_selected {
+                Style::default().fg(Color::Black).bg(Color::White) // 선택된 텍스트는 반전
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+
+        Line::from(spans)
+    }
+
     /// 마우스 좌표를 터미널 좌표로 변환 (Zed 방식)
     fn mouse_to_terminal_coords(&self, mouse_col: u16, mouse_row: u16) -> Option<(u16, u16)> {
-        // 터미널 영역 내부인지 확인 (테두리 제외)
-        if mouse_col == 0 || mouse_row == 0 {
+        // 터미널 영역의 경계 계산 (테두리 포함)
+        let area_left = self.terminal_area.x;
+        let area_top = self.terminal_area.y;
+        let area_right = self.terminal_area.x + self.terminal_area.width;
+        let area_bottom = self.terminal_area.y + self.terminal_area.height;
+
+        // 마우스 좌표가 터미널 영역 내부인지 확인
+        if mouse_col <= area_left || mouse_col >= area_right - 1 ||
+           mouse_row <= area_top || mouse_row >= area_bottom - 1 {
+            debug!("Mouse outside terminal area: ({}, {}) vs area bounds: ({},{}) to ({},{})",
+                   mouse_col, mouse_row, area_left, area_top, area_right, area_bottom);
             return None;
         }
 
-        let terminal_col = mouse_col.saturating_sub(1);  // 테두리 보정
-        let terminal_row = mouse_row.saturating_sub(1);
+        // 터미널 영역 상대 좌표로 변환 (테두리 제외)
+        let terminal_col = mouse_col.saturating_sub(area_left + 1);
+        let relative_terminal_row = mouse_row.saturating_sub(area_top + 1);
 
-        // 터미널 영역 내부에 있는지 확인
+        // 스크롤 오프셋을 고려하여 전체 버퍼에서의 절대 위치 계산
+        let terminal_row = relative_terminal_row + self.scroll_offset;
+
+        // 터미널 영역 내부 크기 확인
         let inner_width = self.terminal_area.width.saturating_sub(2);
         let inner_height = self.terminal_area.height.saturating_sub(2);
 
-        if terminal_col < inner_width && terminal_row < inner_height {
+        if terminal_col < inner_width && relative_terminal_row < inner_height {
+            debug!("Converted mouse coords: ({}, {}) -> terminal ({}, {}) [relative: {}]",
+                   mouse_col, mouse_row, terminal_col, terminal_row, relative_terminal_row);
             Some((terminal_col, terminal_row))
         } else {
+            debug!("Mouse outside inner area: ({}, {}) vs inner size: ({}x{})",
+                   terminal_col, relative_terminal_row, inner_width, inner_height);
             None
         }
     }

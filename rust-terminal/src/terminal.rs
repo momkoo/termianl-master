@@ -205,14 +205,27 @@ impl Terminal {
         Ok(())
     }
 
-    /// 터미널 내용을 렌더링 가능한 형태로 가져오기 (한글 지원 개선)
+    /// 터미널 내용을 렌더링 가능한 형태로 가져오기 (한글 지원 개선 + 스크롤백 히스토리 포함)
     pub fn get_renderable_content(&self) -> Result<Vec<String>> {
         let term = self.term.lock();
         let grid = term.grid();
         let mut lines = Vec::new();
 
-        for line_index in 0..grid.screen_lines() {
-            let line_idx = alacritty_terminal::index::Line(line_index as i32);
+        // 스크롤백 히스토리와 현재 화면을 모두 포함
+        let history_size = grid.history_size();
+        let screen_lines = grid.screen_lines();
+        let total_lines = history_size + screen_lines;
+
+        // 히스토리부터 시작해서 현재 화면까지 모든 라인 가져오기
+        for line_index in 0..total_lines {
+            let line_idx = if line_index < history_size {
+                // 히스토리 영역: 음수 인덱스로 접근
+                alacritty_terminal::index::Line(-(history_size as i32 - line_index as i32))
+            } else {
+                // 화면 영역: 0부터 시작하는 양수 인덱스
+                alacritty_terminal::index::Line((line_index - history_size) as i32)
+            };
+
             let line = &grid[line_idx];
 
             let mut line_content = String::new();
@@ -250,14 +263,20 @@ impl Terminal {
         (cursor_pos.column.0 as u16, cursor_pos.line.0 as u16)
     }
 
-    /// 깜빡이는 터미널 커서 위치 가져오기 (RenderableCursor)
+    /// 깜빡이는 터미널 커서 위치 가져오기 (RenderableCursor - 히스토리 포함 전체 좌표계 기준)
     pub fn get_renderable_cursor(&self) -> (u16, u16, char) {
         let term = self.term.lock();
         let content = term.renderable_content();
-        let cursor_char = term.grid()[content.cursor.point].c;
+        let grid = term.grid();
+        let cursor_char = grid[content.cursor.point].c;
+
+        // 히스토리 크기를 고려하여 전체 좌표계에서의 커서 위치 계산
+        let history_size = grid.history_size();
+        let cursor_row_in_full_buffer = history_size as u16 + content.cursor.point.line.0 as u16;
+
         (
             content.cursor.point.column.0 as u16,
-            content.cursor.point.line.0 as u16,
+            cursor_row_in_full_buffer,
             cursor_char
         )
     }
