@@ -77,15 +77,29 @@ struct App {
     scroll_offset: u16,  // 스크롤 오프셋 (위로 스크롤된 줄 수)
     total_lines: usize,  // 전체 터미널 출력 라인 수
     quit_confirm_count: u8, // Ctrl+Z 종료 확인 카운터
+    auto_scroll_enabled: bool, // 커서 자동 추적 활성화
+    last_manual_scroll: std::time::Instant, // 마지막 수동 스크롤 시간
 }
 
 impl App {
     /// 새 애플리케이션 인스턴스 생성 (Zed 방식 사용)
     fn new(shutdown_signal: Arc<AtomicBool>) -> Result<Self> {
         // Zed 문서에 따른 터미널 생성
-        let working_directory = None; // 현재 디렉토리 사용
+        let working_directory = Some(std::env::current_dir()?); // 현재 실행 디렉토리 사용
         let shell = Shell::System; // 시스템 기본 셸 사용
         let mut env = HashMap::new();
+
+        // PowerShell 프롬프트 축약을 위한 환경변수 설정
+        if let Ok(current_dir) = std::env::current_dir() {
+            let abbreviated_path = Self::abbreviate_path(&current_dir);
+            // PowerShell 함수로 프롬프트 축약 설정
+            let ps_function = format!(
+                "function prompt {{ 'PS {}> ' }}",
+                abbreviated_path
+            );
+            env.insert("PSEXECUTIONPOLICY".to_string(), "Unrestricted".to_string());
+            env.insert("POWERSHELL_PROMPT_OVERRIDE".to_string(), ps_function);
+        }
 
         // 기본 환경 변수들 추가
         for (key, value) in std::env::vars() {
@@ -108,6 +122,8 @@ impl App {
             scroll_offset: 0,
             total_lines: 0,
             quit_confirm_count: 0,
+            auto_scroll_enabled: true, // 기본적으로 자동 추적 활성화
+            last_manual_scroll: std::time::Instant::now(),
         })
     }
 
@@ -117,12 +133,21 @@ impl App {
         loop {
             // 화면 그리기
             ratatui_terminal.draw(|f| {
-                // 전체 영역을 터미널과 스크롤바로 분할
+                // 전체 영역을 상단 정보 패널과 메인 영역으로 분할
+                let top_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([Constraint::Length(1), Constraint::Min(10)].as_ref()) // 정보 패널 1줄 + 터미널 영역
+                    .split(f.area());
+
+                let info_panel_area = top_chunks[0];
+                let main_area = top_chunks[1];
+
+                // 메인 영역을 터미널과 스크롤바로 분할
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .margin(1)
                     .constraints([Constraint::Min(10), Constraint::Length(1)].as_ref()) // 터미널 영역 + 스크롤바 1칸
-                    .split(f.area());
+                    .split(main_area);
 
                 // 실제 터미널 컨텐츠 영역 저장 (스크롤바 제외)
                 self.terminal_area = main_chunks[0];
@@ -195,10 +220,27 @@ impl App {
                     ""
                 };
 
+                // 현재 작업 디렉토리 정보 (축약된 형태)
+                let (current_dir_short, current_dir_full) = std::env::current_dir()
+                    .map(|path| {
+                        let short = format!(" [{}]", Self::abbreviate_path(&path));
+                        let full = format!(" [{}]", path.to_string_lossy());
+                        (short, full)
+                    })
+                    .unwrap_or_else(|_| (String::new(), String::new()));
+
+                // 정보 패널을 한 줄로 컴팩트하게 렌더링
+                let info_text = format!("📁 {}", &current_dir_full[2..current_dir_full.len()-1]);
+                let info_panel = Paragraph::new(info_text)
+                    .style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                    .alignment(ratatui::layout::Alignment::Center);
+
+                f.render_widget(info_panel, info_panel_area);
+
                 let paragraph = Paragraph::new(lines)
                     .block(Block::default()
-                        .title(format!("Rust Terminal{}{}{}{} - 마우스휠/PageUp/Down: 스크롤, Ctrl+Z: 종료",
-                            selection_info, scroll_info, cursor_debug, quit_status))
+                        .title(format!("Rust Terminal{}{}{}{}{} - 마우스휠/PageUp/Down: 스크롤, Ctrl+Z: 종료",
+                            current_dir_short, selection_info, scroll_info, cursor_debug, quit_status))
                         .borders(Borders::ALL))
                         .style(Style::default().bg(Color::Black));
 
@@ -227,6 +269,9 @@ impl App {
                 }
             }
 
+            // 자동 스크롤 상태 업데이트 (3초 후 추적 재활성화만)
+            self.update_auto_scroll();
+
             // 종료 신호 확인
             if self.should_quit || self.shutdown_signal.load(Ordering::Relaxed) {
                 break;
@@ -254,36 +299,68 @@ impl App {
             }
             KeyCode::Enter => {
                 let _ = self.terminal.input(b"\r");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Backspace => {
                 let _ = self.terminal.input(b"\x7f");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Tab => {
                 let _ = self.terminal.input(b"\t");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Esc => {
                 let _ = self.terminal.input(b"\x1b");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Up => {
                 let _ = self.terminal.input(b"\x1b[A");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Down => {
                 let _ = self.terminal.input(b"\x1b[B");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Right => {
                 let _ = self.terminal.input(b"\x1b[C");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::Left => {
                 let _ = self.terminal.input(b"\x1b[D");
+                // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+                self.auto_scroll_enabled = true;
+                self.auto_scroll_to_cursor();
             }
             KeyCode::PageUp => {
                 // Page Up - 한 페이지 위로 스크롤
+                // 수동 스크롤 감지 - 자동 추적 임시 비활성화
+                self.auto_scroll_enabled = false;
+                self.last_manual_scroll = std::time::Instant::now();
+
                 let page_size = self.terminal_area.height.saturating_sub(2) as u16;
                 self.scroll_offset = self.scroll_offset.saturating_sub(page_size);
                 debug!("Page up to offset: {}", self.scroll_offset);
             }
             KeyCode::PageDown => {
                 // Page Down - 한 페이지 아래로 스크롤
+                // 수동 스크롤 감지 - 자동 추적 임시 비활성화
+                self.auto_scroll_enabled = false;
+                self.last_manual_scroll = std::time::Instant::now();
+
                 let page_size = self.terminal_area.height.saturating_sub(2) as u16;
                 let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
                 if self.total_lines > visible_lines {
@@ -294,11 +371,19 @@ impl App {
             }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+Home - 맨 위로
+                // 수동 스크롤 감지 - 자동 추적 임시 비활성화
+                self.auto_scroll_enabled = false;
+                self.last_manual_scroll = std::time::Instant::now();
+
                 self.scroll_offset = 0;
                 debug!("Scrolled to top");
             }
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+End - 맨 아래로
+                // 수동 스크롤 감지 - 자동 추적 임시 비활성화
+                self.auto_scroll_enabled = false;
+                self.last_manual_scroll = std::time::Instant::now();
+
                 let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
                 if self.total_lines > visible_lines {
                     let max_scroll = self.total_lines.saturating_sub(visible_lines) as u16;
@@ -321,6 +406,11 @@ impl App {
 
         debug!("Sending UTF-8 bytes: {:?}", utf8_str.as_bytes());
         let _ = self.terminal.input(utf8_str.as_bytes());
+
+        // 입력 시 자동 추적 활성화 및 커서 위치로 이동
+        self.auto_scroll_enabled = true;
+        self.auto_scroll_to_cursor();
+
         Ok(())
     }
 
@@ -396,6 +486,10 @@ impl App {
                 debug!("Scroll check: total_lines={}, visible_lines={}, current_offset={}",
                     self.total_lines, visible_lines, self.scroll_offset);
 
+                // 수동 스크롤 감지 - 자동 추적 임시 비활성화
+                self.auto_scroll_enabled = false;
+                self.last_manual_scroll = std::time::Instant::now();
+
                 if self.total_lines > visible_lines {
                     let max_scroll = self.total_lines.saturating_sub(visible_lines) as u16;
                     if self.scroll_offset < max_scroll {
@@ -414,6 +508,10 @@ impl App {
                 let visible_lines = self.terminal_area.height.saturating_sub(2) as usize;
                 debug!("Scroll up check: total_lines={}, visible_lines={}, current_offset={}",
                     self.total_lines, visible_lines, self.scroll_offset);
+
+                // 수동 스크롤 감지 - 자동 추적 임시 비활성화
+                self.auto_scroll_enabled = false;
+                self.last_manual_scroll = std::time::Instant::now();
 
                 if self.scroll_offset > 0 {
                     let old_offset = self.scroll_offset;
@@ -818,6 +916,69 @@ impl App {
             debug!("Mouse outside inner area: ({}, {}) vs inner size: ({}x{})",
                    terminal_col, relative_terminal_row, inner_width, inner_height);
             None
+        }
+    }
+
+    /// 자동 스크롤 상태 업데이트 (3초 타이머 관리)
+    fn update_auto_scroll(&mut self) {
+        let now = std::time::Instant::now();
+
+        // 수동 스크롤 후 3초가 지나면 자동 추적만 재활성화 (위치 이동은 하지 않음)
+        if !self.auto_scroll_enabled
+            && now.duration_since(self.last_manual_scroll).as_secs() >= 3 {
+            self.auto_scroll_enabled = true;
+            debug!("자동 추적 재활성화됨 (3초 타임아웃) - 입력 시에만 커서 위치로 이동");
+        }
+    }
+
+    /// 경로를 축약하여 상위\상위\마지막폴더 형태로 변환
+    fn abbreviate_path(path: &std::path::Path) -> String {
+        let components: Vec<_> = path.components()
+            .filter_map(|comp| {
+                if let std::path::Component::Normal(name) = comp {
+                    Some(name.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if components.len() <= 3 {
+            // 3개 이하면 모두 표시
+            components.join("\\")
+        } else {
+            // 3개 초과면 마지막 3개만 표시
+            let last_three = &components[components.len().saturating_sub(3)..];
+            format!("...\\{}", last_three.join("\\"))
+        }
+    }
+
+    /// 커서 위치로 자동 스크롤
+    fn auto_scroll_to_cursor(&mut self) {
+        let (_, cursor_row, _) = self.terminal.get_renderable_cursor();
+        let visible_lines = self.terminal_area.height.saturating_sub(2) as u16;
+
+        // 현재 보이는 영역의 범위 계산
+        let view_start = self.scroll_offset;
+        let view_end = self.scroll_offset + visible_lines;
+
+        // 커서가 화면을 벗어났는지 확인하고 조정
+        if cursor_row < view_start {
+            // 커서가 화면 위에 있으면 위로 스크롤
+            self.scroll_offset = cursor_row;
+            debug!("자동 스크롤 위로: 커서={}행, offset={}", cursor_row, self.scroll_offset);
+        } else if cursor_row >= view_end {
+            // 커서가 화면 아래에 있으면 아래로 스크롤
+            self.scroll_offset = cursor_row.saturating_sub(visible_lines - 1);
+            debug!("자동 스크롤 아래로: 커서={}행, offset={}", cursor_row, self.scroll_offset);
+        }
+
+        // 스크롤 범위 제한
+        if self.total_lines > visible_lines as usize {
+            let max_scroll = self.total_lines.saturating_sub(visible_lines as usize) as u16;
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+        } else {
+            self.scroll_offset = 0;
         }
     }
 
