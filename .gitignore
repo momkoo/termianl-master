@@ -1,0 +1,35 @@
+# Rust
+target/
+Cargo.lock
+*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local configuration
+.claude/
+
+# Reference files (excluded from commits)
+refer/
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
