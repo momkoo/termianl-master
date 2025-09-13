@@ -3,6 +3,10 @@ name = "rust-terminal"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rust-terminal"
+path = "src/main.rs"
+
 [dependencies]
 alacritty_terminal = "0.24"
 anyhow = "1.0"
@@ -13,6 +17,10 @@ smol = "2.0"
 sysinfo = "0.30"
 dirs = "5.0"
 tokio = { version = "1.0", features = ["full"] }
+arboard = "3.4"
+ctrlc = "3.4"
+log = "0.4"
+env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -23,3 +31,4 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+signal-hook = "0.3"

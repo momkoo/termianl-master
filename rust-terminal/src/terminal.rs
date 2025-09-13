@@ -65,11 +65,13 @@ impl EventListener for TerminalListener {
     }
 }
 
-/// Shell 타입 정의 (Zed와 동일)
+/// Shell 타입 정의 (현재는 System만 사용)
 #[derive(Clone, Debug)]
 pub enum Shell {
     System,
+    #[allow(dead_code)]
     Program(String),
+    #[allow(dead_code)]
     WithArguments {
         program: String,
         args: Vec<String>,
@@ -86,6 +88,7 @@ pub struct TerminalBuilder {
 pub struct Terminal {
     pty_tx: Notifier,
     term: Arc<FairMutex<Term<TerminalListener>>>,
+    #[allow(dead_code)]
     events_rx: Option<UnboundedReceiver<AlacTermEvent>>,
 }
 
@@ -97,8 +100,6 @@ impl TerminalBuilder {
         mut env: HashMap<String, String>,
         window_id: u64,
     ) -> Result<TerminalBuilder> {
-        println!("TerminalBuilder::new() 시작");
-
         // 1. Zed와 동일한 환경 변수 설정
         if std::env::var("LANG").is_err() {
             env.entry("LANG".to_string())
@@ -109,8 +110,6 @@ impl TerminalBuilder {
         env.insert("TERM_PROGRAM".to_string(), "zed".to_string());
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("TERM_PROGRAM_VERSION".to_string(), "1.0.0".to_string());
-
-        println!("환경 변수 설정 완료");
 
         // 2. Shell 파라미터 설정 (Zed와 동일한 로직)
         let shell_program = match shell.clone() {
@@ -133,8 +132,6 @@ impl TerminalBuilder {
             _ => None,
         };
 
-        println!("Shell 설정: {}", shell_program);
-
         // 3. PTY 옵션 구성 (Zed와 동일)
         let alac_shell = AlacShell::new(shell_program, shell_args.unwrap_or_default());
         let working_dir = working_directory
@@ -146,8 +143,6 @@ impl TerminalBuilder {
             env: env.into_iter().collect(),
             hold: false,
         };
-
-        println!("PTY 옵션 구성 완료");
 
         // 4. 이벤트 채널 생성
         let (events_tx, events_rx) = unbounded();
@@ -162,7 +157,6 @@ impl TerminalBuilder {
         );
 
         let term = Arc::new(FairMutex::new(term));
-        println!("Term 생성 완료");
 
         // 6. PTY 생성 (Zed와 동일)
         let pty = match tty::new(&pty_options, bounds.into(), window_id) {
@@ -171,8 +165,6 @@ impl TerminalBuilder {
                 bail!("PTY 생성 실패: {}", error);
             }
         };
-
-        println!("PTY 생성 완료");
 
         // 7. EventLoop 연결 (Zed와 동일)
         let event_loop = EventLoop::new(
@@ -183,13 +175,9 @@ impl TerminalBuilder {
             false, // hold
         )?;
 
-        println!("EventLoop 생성 완료");
-
         // 8. IO 스레드 시작 (Zed와 동일)
         let pty_tx = event_loop.channel();
         let _io_thread = event_loop.spawn();
-
-        println!("IO 스레드 시작 완료");
 
         let terminal = Terminal {
             pty_tx: Notifier(pty_tx),
@@ -217,7 +205,7 @@ impl Terminal {
         Ok(())
     }
 
-    /// 터미널 내용을 렌더링 가능한 형태로 가져오기 (Zed 방식)
+    /// 터미널 내용을 렌더링 가능한 형태로 가져오기 (한글 지원 개선)
     pub fn get_renderable_content(&self) -> Result<Vec<String>> {
         let term = self.term.lock();
         let grid = term.grid();
@@ -228,27 +216,66 @@ impl Terminal {
             let line = &grid[line_idx];
 
             let mut line_content = String::new();
-            for cell in line {
-                // 모든 문자를 그대로 추가 (색상 정보는 나중에 처리)
-                line_content.push(cell.c);
+            let mut col_index = 0;
+
+            while col_index < line.len() {
+                let cell = &line[alacritty_terminal::index::Column(col_index)];
+                let ch = cell.c;
+
+                // 실제 문자만 추가 (null character와 wide char spacer 제외)
+                if ch != '\0' && ch != ' ' || !cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER) {
+                    line_content.push(ch);
+                }
+
+                // wide character인 경우 다음 셀은 spacer이므로 건너뛰기
+                if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) {
+                    col_index += 2; // wide char는 2개 셀을 차지
+                } else {
+                    col_index += 1;
+                }
             }
 
-            // 줄 끝의 공백 제거하지 않고 유지 (터미널 형태 보존)
+            // 줄 끝의 공백 유지
             lines.push(line_content);
         }
 
         Ok(lines)
     }
 
-    /// 커서 위치 가져오기
+    /// 커서 위치 가져오기 (마우스 커서 위치 - 디버그용)
     pub fn get_cursor(&self) -> (u16, u16) {
         let term = self.term.lock();
         let grid = term.grid();
-        let cursor_pos = &grid.cursor;
-        (cursor_pos.point.column.0 as u16, cursor_pos.point.line.0 as u16)
+        let cursor_pos = grid.cursor.point;
+        (cursor_pos.column.0 as u16, cursor_pos.line.0 as u16)
+    }
+
+    /// 깜빡이는 터미널 커서 위치 가져오기 (RenderableCursor)
+    pub fn get_renderable_cursor(&self) -> (u16, u16, char) {
+        let term = self.term.lock();
+        let content = term.renderable_content();
+        let cursor_char = term.grid()[content.cursor.point].c;
+        (
+            content.cursor.point.column.0 as u16,
+            content.cursor.point.line.0 as u16,
+            cursor_char
+        )
+    }
+
+    /// 터미널이 마우스 모드를 지원하는지 확인
+    pub fn is_mouse_mode_enabled(&self) -> bool {
+        let term = self.term.lock();
+        let mode = term.mode();
+        // MOUSE_REPORT_CLICK, MOUSE_DRAG, MOUSE_MOTION 등 마우스 모드 확인
+        mode.intersects(
+            alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+            | alacritty_terminal::term::TermMode::MOUSE_DRAG
+            | alacritty_terminal::term::TermMode::MOUSE_MOTION
+        )
     }
 
     /// 터미널이 대체 화면 모드인지 확인
+    #[allow(dead_code)]
     pub fn is_alternate_screen(&self) -> bool {
         let term = self.term.lock();
         term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
